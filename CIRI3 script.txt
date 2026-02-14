@@ -1,0 +1,469 @@
+##_________________CircRNA Detection and Differential Expression with CIRI3__________________________##
+
+
+#---------------------------------------------------------------#
+#Environment Setup: Installing CIRI3 and All Dependencies
+#---------------------------------------------------------------#
+
+####Step 1: Install Conda Package Manager####
+
+# Download Miniconda installer for Linux (64-bit)
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+ 
+# Run the installer
+bash Miniconda3-latest-Linux-x86_64.sh
+ 
+# Activate conda in your current shell session
+source ~/.bashrc
+ 
+# Verify successful installation
+conda --version
+
+####Step 2: Clone CIRI3 Repository from GitHub####
+
+# Create a dedicated directory for bioinformatics tools
+mkdir -p ~/bioinfo_tools
+cd ~/bioinfo_tools
+ 
+# Clone the CIRI3 repository
+git clone https://github.com/gyjames/CIRI3.git
+ 
+# Navigate into the CIRI3 directory
+cd CIRI3
+
+
+####Step 3: Conda Environment####
+# Create the conda environment from the YAML file
+conda env create -n CIRI3 -f ./environment.yaml
+
+# Activate the newly created CIRI3 environment
+conda activate CIRI3
+
+# Install alignment, processing, and data download tools
+conda install -c bioconda bwa samtools sra-tools subread -y
+
+# Test Java (CIRI3 is Java-based)
+conda install -c conda-forge openjdk=8 -y
+java -version
+ 
+# Test CIRI3 JAR file
+java -jar ~/bioinfo_tools/CIRI3/CIRI3_Java_1.8.0.jar
+ 
+# Test BWA aligner
+bwa 2>&1 | head -n 3
+ 
+# Test SAMtools
+samtools --version
+ 
+# Test SRA Toolkit
+fastq-dump --version
+ 
+# Test featureCounts (from Subread package)
+featureCounts -v
+ 
+# Test R packages (edgeR and limma)
+R -e "library(edgeR); library(limma)"
+
+
+#---------------------------------------------------------------#
+#Data Preparation: Downloading and Organizing GSE97239
+#---------------------------------------------------------------#
+
+####Step 4: Create Project Directory Structure####
+
+# Create main project directory
+mkdir -p ~/CIRI3_analysis
+cd ~/CIRI3_analysis
+ 
+# Create subdirectories for organized workflow
+mkdir -p data/raw_fastq          # Raw FASTQ files from SRA
+mkdir -p data/reference           # Genome and annotation files
+mkdir -p results/alignment        # BWA-MEM output (SAM files)
+mkdir -p results/ciri3            # All CIRI3 outputs (single & multi-sample)
+mkdir -p results/DE               # Differential expression results
+mkdir -p logs                     # Log files for troubleshooting
+
+#Verify directory structure
+tree -L 2 ~/CIRI3_analysis
+
+#Expected output
+#  /home/prithasaha/CIRI3_analysis
+#  ├── data
+#  │   ├── raw_fastq
+#  │   └── reference
+#  ├── logs
+#  └── results
+#      ├── DE
+#      ├── alignment
+#      └── ciri3
+
+####Step 4: Download Reference Genome and Annotation####
+
+cd ~/CIRI3_analysis/data/reference
+ 
+# Download human genome (GRCh38/hg38) from Ensembl
+wget https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+ 
+# Download gene annotation (GTF format)
+wget https://ftp.ensembl.org/pub/release-110/gtf/homo_sapiens/Homo_sapiens.GRCh38.110.gtf.gz
+ 
+# Decompress files
+gunzip Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+gunzip Homo_sapiens.GRCh38.110.gtf.gz
+
+#Index Reference Genome for BWA
+# Build BWA index
+bwa index -a bwtsw Homo_sapiens.GRCh38.dna.primary_assembly.fa
+
+
+####Step 5: Download RNA-seq Data from SRA####
+
+cd ~/CIRI3_analysis/data/raw_fastq
+ 
+# Download all 6 samples using fastq-dump
+# Cancer samples (n=3)
+fastq-dump --split-files --gzip SRR5398213
+fastq-dump --split-files --gzip SRR5398214
+fastq-dump --split-files --gzip SRR5398215
+ 
+# Control samples (n=3)
+fastq-dump --split-files --gzip SRR5398216
+fastq-dump --split-files --gzip SRR5398217
+fastq-dump --split-files --gzip SRR5398218
+
+
+#To move already downloaded files
+mv /mnt/d/Noncoding_RNA-seq_tutorials/CIRI3-circ/raw-data/* data/raw_fastq/
+
+cp -r /mnt/d/Noncoding_RNA-seq_tutorials/CIRI3-circ/raw-data/* data/raw_fastq/   #to copy
+
+
+####Step 6: Define Paths for Analysis####
+
+# Define paths (used throughout the analysis)
+CIRI3_JAR=~/bioinfo_tools/CIRI3/CIRI3_Java_1.8.0.jar
+GENOME=~/CIRI3_analysis/data/reference/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+GTF=~/CIRI3_analysis/data/reference/Homo_sapiens.GRCh38.110.gtf
+FASTQ_DIR=~/CIRI3_analysis/data/raw_fastq
+SAM_DIR=~/CIRI3_analysis/results/alignment
+CIRI_DIR=~/CIRI3_analysis/results/ciri3
+DE_DIR=~/CIRI3_analysis/results/DE
+
+####Step 7: Read Alignment with BWA-MEM####
+cd ~/CIRI3_analysis
+ 
+# Align all samples with circRNA-optimized parameters
+for SRR in SRR5398213 SRR5398214 SRR5398215 SRR5398216 SRR5398217 SRR5398218; do
+    bwa mem -T 19 -t 8 \
+        ${GENOME} \
+        ${FASTQ_DIR}/${SRR}_1.fastq.gz \
+        ${FASTQ_DIR}/${SRR}_2.fastq.gz \
+        > ${SAM_DIR}/${SRR}.sam
+done
+
+#The critical parameter is -T 19, which sets the minimum alignment score threshold. 
+#This lower threshold (compared to default -T 30) allows BWA to report split alignments that span back-splice junctions.
+
+
+#---------------------------------------------------------------#
+#CircRNA Detection with CIRI3
+#---------------------------------------------------------------#
+
+####Step 8: Single-Sample Mode (Required for DE_BSJ)####
+# Run CIRI3 on each sample individually
+for SRR in SRR5398213 SRR5398214 SRR5398215 SRR5398216 SRR5398217 SRR5398218; do
+    java -jar ${CIRI3_JAR} \
+        -I ${SAM_DIR}/${SRR}.sam \
+        -O ${CIRI_DIR}/${SRR}_ciri3 \
+        -F ${GENOME} \
+        -A ${GTF}
+done
+
+#This runs CIRI3 in single-sample mode (default -W 0) on each sample separately. 
+#Each sample is processed independently, and CIRI3 detects circRNAs by identifying reads with back-splice junction patterns. 
+#The -A ${GTF} parameter provides gene annotation, which allows CIRI3 to classify circRNAs by type (exonic, intronic, intergenic) and associate them with host genes. 
+#Single-sample mode outputs are required for the DE_BSJ (BSJ-based differential expression) analysis.
+
+
+####Step 9: Multi-Sample Mode (Required for DE_Ratio and DE_Relative)####
+
+# Create sample list file with absolute paths
+cat > ${CIRI_DIR}/sample_list.txt << EOF
+${SAM_DIR}/SRR5398213.sam
+${SAM_DIR}/SRR5398214.sam
+${SAM_DIR}/SRR5398215.sam
+${SAM_DIR}/SRR5398216.sam
+${SAM_DIR}/SRR5398217.sam
+${SAM_DIR}/SRR5398218.sam
+EOF
+ 
+# Run CIRI3 in multi-sample mode
+java -jar ${CIRI3_JAR} \
+    -I ${CIRI_DIR}/sample_list.txt \
+    -O ${CIRI_DIR}/all_samples.txt \
+    -F ${GENOME} \
+    -A ${GTF} \
+    -W 1 \
+    -T 8
+	
+# Run CIRI3 in multi-sample mode (-W 1)
+# This analyzes all samples together instead of individually.
+# The sample_list.txt file must contain absolute paths to all SAM files.
+#
+# Multi-sample mode is more efficient than running samples separately.
+# It automatically generates combined expression matrices.
+#
+# -T 8 specifies the use of 8 threads for parallel processing.
+#
+# NOTE:
+# Multi-sample mode is REQUIRED for DE_Ratio and DE_Relative analyses,
+# because these methods require the BSJ and FSJ matrices,
+# which are generated only in multi-sample mode.
+
+# Output files generated:
+#
+# all_samples.txt
+#   → CircRNA information for all detected circRNAs across all samples
+#
+# all_samples.txt.BSJ_Matrix
+#   → BSJ (Back-Splice Junction) read counts matrix
+#     Rows = circRNAs
+#     Columns = samples
+#
+# all_samples.txt.FSJ_Matrix
+#   → FSJ (Forward-Splice Junction) read counts matrix
+#     Rows = circRNAs
+#     Columns = samples
+#
+# These matrices provide comprehensive quantification data
+# required for junction ratio and isoform switching analyses.
+
+
+####Step 10: Convert SAM to Sorted BAM####
+
+# Convert SAM to BAM, sort, and index
+for SRR in SRR5398213 SRR5398214 SRR5398215 SRR5398216 SRR5398217 SRR5398218; do
+    samtools view -bS ${SAM_DIR}/${SRR}.sam > ${SAM_DIR}/${SRR}.bam
+    samtools sort ${SAM_DIR}/${SRR}.bam -o ${SAM_DIR}/${SRR}.sorted.bam
+    samtools index ${SAM_DIR}/${SRR}.sorted.bam
+done
+
+####Step 11: Run featureCounts for Gene Expression####
+
+# Quantify gene expression using featureCounts
+featureCounts -p -T 8 -t exon -g gene_id \
+    -a ${GTF} \
+    -o ${DE_DIR}/gene_counts.txt \
+    ${SAM_DIR}/*.sorted.bam
+	
+# Count reads mapping to each gene using the GTF annotation
+#
+# -p      → Indicates paired-end sequencing data
+# -T 8    → Uses 8 threads for parallel processing
+# -t exon → Counts reads mapping specifically to exons
+# -g gene_id → Summarizes read counts at the gene level using gene_id
+#
+# The output file contains read counts for all genes across all samples.
+# These gene-level counts will be used to normalize circRNA expression
+# in downstream DE_BSJ analysis.
+
+####Step 11: Format Gene Expression Matrix for CIRI3####
+
+# Extract gene counts and clean up column names
+cut -f1,7-12 ${DE_DIR}/gene_counts.txt | \
+    tail -n +2 > ${DE_DIR}/gene_expression_temp.txt
+ 
+# Remove file paths and .sorted.bam suffix from sample names
+sed -i 's|.*/||g; s/\.sorted\.bam//g' ${DE_DIR}/gene_expression_temp.txt
+ 
+# Add proper header
+echo -e "Geneid\tSRR5398213\tSRR5398214\tSRR5398215\tSRR5398216\tSRR5398217\tSRR5398218" \
+    > ${DE_DIR}/gene_expression.txt
+tail -n +2 ${DE_DIR}/gene_expression_temp.txt >> ${DE_DIR}/gene_expression.txt
+
+# Reformat featureCounts output for compatibility with CIRI3
+#
+# Steps performed:
+# 1. Extract only relevant columns:
+#    - Column 1  → Gene IDs
+#    - Columns 7-12 → Read count columns for each sample
+#
+# 2. Remove metadata/comment lines generated by featureCounts.
+#
+# 3. Clean sample names:
+#    - Remove full file paths
+#    - Remove file suffixes (e.g., .bam)
+#    - Keep only clean sample identifiers
+#
+# 4. Add a clean header row with formatted sample names.
+#
+# Final output: gene_expression.txt
+#   - Column 1 → Gene IDs
+#   - Subsequent columns → Read counts per sample
+#   - Sample names match those used in other analysis files
+#     to ensure compatibility in downstream CIRI3 analyses.
+
+#---------------------------------------------------------------#
+#Differential Expression Analysis
+#---------------------------------------------------------------#
+
+# CIRI3 provides three statistical models for differential expression (DE) analysis.
+# Each model tests a different biological hypothesis regarding circRNA regulation.
+
+# ------------------------------------------------------------------
+# DE_BSJ: Absolute circRNA abundance changes
+# ------------------------------------------------------------------
+# This is the standard differential expression method in CIRI3.
+#
+# It tests whether the absolute abundance of circRNAs
+# (based on BSJ read counts) differs between conditions.
+#
+# Conceptually similar to traditional RNA-seq DE analysis:
+#   → Compares circRNA expression levels across groups
+#   → Identifies circRNAs that are significantly upregulated
+#     or downregulated between conditions.
+#
+# Biological interpretation:
+#   Changes reflect overall circRNA abundance differences,
+#   regardless of host gene expression.
+
+#Create sample information file
+cat > ${DE_DIR}/sample_info_bsj.tsv << EOF
+Sample    Path    Class   Num
+SRR5398213    ${CIRI_DIR}/SRR5398213_ciri3.txt   Cancer  1
+SRR5398214    ${CIRI_DIR}/SRR5398214_ciri3.txt   Cancer  2
+SRR5398215    ${CIRI_DIR}/SRR5398215_ciri3.txt   Cancer  3
+SRR5398216    ${CIRI_DIR}/SRR5398216_ciri3.txt   Control 1
+SRR5398217    ${CIRI_DIR}/SRR5398217_ciri3.txt   Control 2
+SRR5398218    ${CIRI_DIR}/SRR5398218_ciri3.txt   Control 3
+EOF
+
+# Create a tab-separated metadata file linking each sample
+# to its corresponding CIRI3 output and experimental information.
+#
+# Columns description:
+#
+# Path  → Absolute path to each single-sample CIRI3 output file
+#         (required for CIRI3 to locate circRNA results)
+#
+# Class → Experimental group assignment
+#         Example: Cancer vs Control
+#         Defines the conditions to be compared in DE analysis
+#
+# Num   → Biological replicate number
+#         Use sequential numbers (1, 2, 3, ...)
+#         for unpaired differential expression analysis
+#
+# This file enables CIRI3 to:
+#   - Recognize sample grouping
+#   - Associate replicates correctly
+#   - Perform statistical testing between defined conditions
+
+
+#Run DE_BSJ analysis
+java -jar ${CIRI3_JAR} DE_BSJ \
+    -I ${DE_DIR}/sample_info_bsj.tsv \
+    -G ${DE_DIR}/gene_expression.txt \
+    -O ${DE_DIR}/BSJ_DE_results.txt \
+    -P 0.05
+	
+# Perform BSJ-based differential expression analysis using edgeR
+#
+# -I → Sample information file (metadata linking samples, groups, replicates)
+# -G → Gene expression file (gene_expression.txt)
+#       Used for host gene–level normalization
+#       This is why gene_expression.txt was generated earlier
+# -O → Output file name for differential expression results
+# -P 0.05 → P-value significance threshold (default cutoff = 0.05)
+#
+# Method overview:
+#   1. CIRI3 normalizes circRNA BSJ counts by the expression
+#      level of their corresponding host genes.
+#   2. edgeR is then applied to perform statistical testing
+#      between experimental conditions.
+#   3. Significantly differentially expressed circRNAs
+#      are identified based on the specified p-value cutoff.
+#
+# Biological interpretation:
+#   Detects circRNAs whose absolute abundance changes
+#   between conditions after accounting for host gene expression.
+# ------------------------------------------------------------------
+# DE_Ratio: Junction Ratio Changes
+# ------------------------------------------------------------------
+# This analysis tests whether the proportion of circular versus linear transcripts
+# differs between experimental conditions. It evaluates changes in circularization
+# efficiency independent of total host gene expression levels.
+#
+#Create sample information file:
+#   Create simplified sample information file
+#   This file contains only sample names and their corresponding experimental classes.
+#   File paths are not required because this analysis uses the count matrices
+#   generated from the multi-sample mode output.
+
+cat > ${DE_DIR}/sample_info_ratio.tsv << EOF
+Sample    Class
+SRR5398213    Cancer
+SRR5398214    Cancer
+SRR5398215    Cancer
+SRR5398216    Control
+SRR5398217    Control
+SRR5398218    Control
+EOF
+
+#Run DE_Ratio analysis
+java -jar ${CIRI3_JAR} DE_Ratio \
+    -I ${DE_DIR}/sample_info_ratio.tsv \
+    -BM ${CIRI_DIR}/all_samples.txt.BSJ_Matrix \
+    -FM ${CIRI_DIR}/all_samples.txt.FSJ_Matrix \
+    -O ${DE_DIR}/JR_DE_results.txt \
+    -T 8
+	
+# Perform junction ratio-based differential expression analysis
+# -BM : input BSJ (Back-Splice Junction) count matrix from multi-sample mode
+# -FM : input FSJ (Forward-Splice Junction) count matrix from multi-sample mode
+# -T 8 : run analysis using 8 computational threads
+#
+# This tests whether the circular-to-linear junction ratio
+# BSJ / (BSJ + FSJ) differs significantly between experimental conditions.
+# A higher ratio in cancer samples indicates increased circularization
+# efficiency, even when total host gene expression remains unchanged.
+
+# ------------------------------------------------------------------
+# DE_Ratio: DE_Relative: Isoform Switching Events
+# ------------------------------------------------------------------
+# Test for isoform switching events
+# This analysis identifies changes in the relative balance between
+# circular and linear isoforms, or shifts in the proportion of
+# different circular isoforms originating from the same host gene
+# across experimental conditions.
+
+#Create circRNA-gene mapping file:
+
+# Extract circRNA_ID (column 1) and gene_id (column 10) from CIRI3 output
+
+# Create circRNA-to-host gene mapping file
+# This generates a two-column file linking each circRNA to its host gene.
+# The awk command skips the header line (NR > 1),
+# then extracts column 1 (circRNA_ID) and column 10 (gene_id)
+# from the multi-sample CIRI3 output.
+
+# This mapping file is required for DE_Relative analysis
+# to identify isoforms originating from the same host gene.
+
+awk -F'\t' 'NR>1 {print $1"\t"$10}' ${CIRI_DIR}/all_samples.txt > ${DE_DIR}/circ_gene.txt
+
+#Run DE_Relative analysis
+java -jar ${CIRI3_JAR} DE_Relative \
+    -I ${DE_DIR}/sample_info_ratio.tsv \
+    -M ${CIRI_DIR}/all_samples.txt.BSJ_Matrix \
+    -GC ${DE_DIR}/circ_gene.txt \
+    -O ${DE_DIR}/RE_switching_results.txt \
+    -T 8
+	
+# Perform isoform switching analysis
+# -M  : input BSJ (Back-Splice Junction) count matrix
+# -GC : input circRNA-to-host gene mapping file
+#
+# This analysis identifies genes in which the relative proportions
+# of different circular isoforms shift between experimental conditions,
+# revealing potential isoform switching events.
